@@ -1,8 +1,13 @@
 import numpy as np
 import pandas as pd
 import pickle
+import math
 import random
 import collections 
+import argparse
+from time import time
+from tqdm import tqdm
+
 
 from nltk.corpus import stopwords
 from sklearn.decomposition import TruncatedSVD
@@ -14,9 +19,13 @@ from sklearn.preprocessing import normalize
 from keras.models import Sequential
 from keras.layers import Dense
 from keras import backend as K
+from keras.models import load_model
+
+import tensorflow as tf
+from tensorflow.python.keras.callbacks import TensorBoard
 
 
-batch_size = 10
+batch_size = 40 #before was 10
 gamma = 0.999
 
 eps_start = 1
@@ -26,7 +35,7 @@ eps_decay = 0.001
 target_update = 10
 memory_size = 100000
 lr = 0.001
-num_episodes = 6040         # number of users = 6040
+num_episodes = 6040       # number of users = 6040
 
 
 svd_vector_dim = 300       ## vector dim for svd
@@ -67,6 +76,22 @@ class Memory():
 
 
 
+def add_arguments():
+    global batch_size, gamma, num_episodes
+
+    parser = argparse.ArgumentParser(description='input hyperparams')
+
+    parser.add_argument('-b', '--batch_size', type=int, help='Batch size of Experience Replay memory', default=batch_size)
+    parser.add_argument('-g', '--gamma', type=int, help='gamma value; default is 0.999', default=gamma)
+    parser.add_argument('-ne', '--num_episodes', type=int, help='No. of episodes(or users) to train for', default=num_episodes)
+    args = parser.parse_args()
+
+    batch_size = args.batch_size
+    gamma = args.gamma
+    num_episodes = args.num_episodes
+
+    return 1
+
 
 def preproc(path):
     ## creates a new column in data_m - title_genre that has a concatenation of title & genre
@@ -100,9 +125,10 @@ def create_item_vectors(data_r, vectors, userId):
     ## this returns a list of movie vectors watched by each user
     ## currently only for 1st user
 
-    item_ids = list(data_r.loc[data_r['userId'] == userId]['itemId']) #selecting first user's item ids
+    item_ids = list(data_r.loc[data_r['userId'] == userId]['itemId']) 
 
-    ratings = list(data_r.loc[data_r['userId'] == userId]['rating']) #selecting first user's ratings
+
+    ratings = list(data_r.loc[data_r['userId'] == userId]['rating']) 
     
     items = []
 
@@ -111,18 +137,15 @@ def create_item_vectors(data_r, vectors, userId):
         if np.isnan(ratings[i]):
             pass
 
-        items.append(Item(item_ids[i], vectors[i], ratings[i]))
+        items.append(Item(item_ids[i], vectors[item_ids[i]], ratings[i]))
 
     return items #item objects for each user
 
 def create_item_vectors_all_users(data_r, vectors):
     items = []
-    max = -1
+    
     for i in range(num_episodes):   #no. of users
-        if len(create_item_vectors(data_r, vectors, i)) > max:
-            max = len(create_item_vectors(data_r, vectors, i))
         items.append(create_item_vectors(data_r, vectors, i))
-
     
     return items        #len should be 6040
 
@@ -144,9 +167,9 @@ def DQN(input_dim, output_dim, action=None):
     ## creates the DQN model, needs paramater tuning
 
     model = Sequential()
-    model.add(Dense(128, input_dim=input_dim, activation='relu'))
-    model.add(Dense(64, activation='relu'))
-    model.add(Dense(32, activation='tanh'))
+    model.add(Dense(512, input_dim=input_dim, activation='relu'))
+    model.add(Dense(1024, activation='relu'))
+    model.add(Dense(512, activation='tanh'))
     model.add(Dense(output_dim, activation='softmax'))
 
     model.compile(loss='mse', optimizer='adam')
@@ -157,9 +180,13 @@ def DQN(input_dim, output_dim, action=None):
 def get_initial_state(items):
     ## concatenates the first k(=state_stack_size) movie vectors. which is the initial state
 
+
     state = []
+
     for item in items[:state_stack_size]:
         state.extend(item.vector)
+
+
 
     # now we remove those movies from the item_vector list so that it isnt going to be recommended again
     # here we are deleting from the original item_vectors; bcuz in python references are passed 
@@ -167,28 +194,40 @@ def get_initial_state(items):
 
     return state
 
-def select_action(state, policy_net, items):
+def select_action(state, policy_net, items, timestep):
     
-
-    rate = eps_start    #this needs to be changed; decay needs to be added in!!!
+    #this needs to be changed; decay needs to be added in!!!
+    rate = eps_end + (eps_start - eps_end) * (math.exp(-1 * timestep * eps_decay))
 
     if random.random() > rate:
         #get action from q table/network
-        action = np.argmax(policy_net.predict(state))     # here predict is used to get action
+        states = np.asarray([state])
+        action = np.argmax(policy_net.predict(states))     # here predict is used to get action
     else:
         action = random.randrange(0, len(items))
 
     return action
 
 
-def get_reward(action, items):
+def get_reward(action, items, data_r):
+    # data_r is required to calc avg rating for a particular movie
+    # (already_watched, going_to_watch, never_watched)
     global movies_watched
 
-    if movies_watched[items[action].id] == True:
+    if (action in movies_watched) and (movies_watched[action] == True): # already_watched case
         reward = 0                  #reward should be 0 so that movies arent repeated
-    else:   
-        reward = items[action].rating
-        movies_watched[items[action].id] = True     # sets hash table value to True for that particular movie
+    else:
+        if(action not in movies_watched):
+            # reward is the avg ratings for the movie by all users
+            # never_watched case
+            reward = np.mean(list(data_r.loc[data_r['itemId'] == action]['rating']))
+        
+        else:
+            # going_to_watch
+            for item in items:
+                if item.id == action:
+                    reward = item.rating
+                    movies_watched[action] = True    # sets hash table value to True for that particular movie
 
 
     
@@ -196,10 +235,15 @@ def get_reward(action, items):
 
 
 
-def get_state(state, action, items):
+def get_state(state, action, items, vectors):
+    # vectors is reqd, to get the vector of the movie not watched by user at all
     #state = list(state)
     state = state[svd_vector_dim: ]
-    state.extend(items[action].vector)
+
+    if(action not in items):
+        state.extend(vectors[action])
+    else:    
+        state.extend(items[action].vector)
 
     return state
 
@@ -207,17 +251,28 @@ def get_state(state, action, items):
 
 
 def main():
+    add_arguments()
+
     path = 'data/'
     data_m, data_r = preproc(path)
     vectors = create_tfidf_svd(data_m['title_genre'], svd_vector_dim) 
-    items = create_item_vectors_all_users(data_r, vectors)
-    
+    #items = create_item_vectors_all_users(data_r, vectors)
+
+    # with open("out_files/items.pickle", "wb") as f:
+    #     pickle.dump(items, f)
+
+    with open("out_files/items.pickle", "rb") as f:
+        items = pickle.load(f)
+
     policy_net = DQN(input_dim=state_stack_size*svd_vector_dim, output_dim=output_dim)
     target_net = DQN(input_dim=state_stack_size*svd_vector_dim, output_dim=output_dim)
 
+    tensorboard = TensorBoard(log_dir="logs/{}".format(time()))
 
     memory = Memory()
-    for episode in range(num_episodes):
+
+
+    for episode in tqdm(range(num_episodes)):
         memory.clear()                       # reset
         create_hash(items[episode])
 
@@ -227,9 +282,9 @@ def main():
 
         timesteps = len(items[episode])     # timesteps is no. of movies watched by each user
         for count, timestep in enumerate(range(timesteps)):
-            action = select_action(state, policy_net, items[episode])    #action is a number, indicating which movie id is selected
-            reward = get_reward(action, items[episode])
-            next_state = get_state(state, action, items[episode])       # passing old state
+            action = select_action(state, policy_net, items[episode], timestep)    #action is a number, indicating which movie id is selected
+            reward = get_reward(action, items[episode], data_r)
+            next_state = get_state(state, action, items[episode], vectors)       # passing old state
             memory.push((state, action, next_state, reward))
             
             
@@ -264,13 +319,20 @@ def main():
                 X = np.asarray(X)
                 y = np.asarray(y)
 
-                policy_net.fit(X, y, verbose=1)
+                policy_net.fit(X, y, verbose=0)
+
+                with open("out_files/policy_net.pickle", "wb") as f:
+                    pickle.dump(policy_net, f)
             
 
             state = next_state
 
-        if count%10 == 0:
-            target_net.fit(X, y, verbose=1)
+        if count%50 == 0:
+            target_net.fit(X, y, verbose=0)# callbacks=[tensorboard])
+
+            with open("out_files/target_net.pickle", "wb") as f:
+                pickle.dump(target_net, f)
+            #target_net.save('out_files/target_net.h5')
 
         print(total_reward)
 
