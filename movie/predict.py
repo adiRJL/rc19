@@ -5,6 +5,24 @@ import random
 import numpy as np
 import pickle
 import pandas as pd
+import argparse
+
+model_name = "512_1024_512_100"
+n_random_users = 10
+
+def add_arguments():
+    global model_name, n_random_users
+
+    parser = argparse.ArgumentParser(description='input model name')
+
+    parser.add_argument('-mn', '--model_name', type=str, help='Name of the pickled model file', default=model_name)
+    parser.add_argument('-nru', '--n_random_users', type=str, help='No. of random users to sample', default=n_random_users)
+    args = parser.parse_args()
+
+    model_name = args.model_name
+    n_random_users = args.n_random_users
+
+    return 1
 
 #from keras.models import load_model
 def mergeDatasets(path):    #takes the path and returns a merged dataset
@@ -55,7 +73,7 @@ def avg_rating_movies(path):
 def find_precision(ratings):
     relevent = not_relevant = 0
     for r in ratings:
-        if r>3:
+        if r>3.3:
             relevent += 1
         else:
             not_relevant += 1
@@ -67,21 +85,28 @@ def find_precision(ratings):
 
 
 def main():
-    path = 'data/'
-    data = avg_rating_movies(path) # returns df of mean ratings
+    add_arguments()
 
+    path = 'data/'
+    # data = avg_rating_movies(path) # returns df of mean ratings
+
+    # with open("out_files/user_item_pair.pickle", "wb") as f:
+    #     pickle.dump(data, f)
+
+    with open("out_files/user_item_pair.pickle", "rb") as f:
+        data = pickle.load(f)    
 
     with open("out_files/items.pickle", "rb") as f:
         items = pickle.load(f)
 
-    with open("out_files/target_net/512_1024_512_100.pickle", "rb") as f:
+    with open("out_files/target_net/" + model_name + ".pickle", "rb") as f:
         target_net = pickle.load(f)
 
 
 
     #target_net = load_model('out_files/target_net.h5')   
 
-    random_users_id = random.sample(range(100, 6040), 30)
+    random_users_id = random.sample(range(100, 6040), n_random_users) # this gives n random users' IDs
         
     output = []
     ratings = []
@@ -98,17 +123,17 @@ def main():
 
         ratings.append(rating)
 
-        #print(np.max(q_vector), np.min(q_vector))
+        print(np.max(q_vector), np.min(q_vector))
 
 
         output.append(action)
 
-    print("\n\n\n", output)
-    print("\n\n\n", ratings)
+    print("\n\n\nThese are the recommended movies ", output)
+    print("\n\n\nThese are the ratings for those movies ", ratings)
 
 
     precision = find_precision(ratings)
-    print(precision)
+    print("The precision is ", precision)
 
 
 
